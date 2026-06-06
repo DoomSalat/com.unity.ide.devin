@@ -1,2 +1,1 @@
-# Unity meta files — generated locally, not part of the package
-*.meta
+# No ignores — .meta files must be included for Unity Package Manager

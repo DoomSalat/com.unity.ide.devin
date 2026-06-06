@@ -30,10 +30,10 @@ namespace Unity.Devin.Editor
 		private const string ApplicationsDir = "/Applications";
 #else
 		private const string LinuxBinary = "devin";
-		private static readonly string[] LinuxPaths = { "/usr/bin/devin", "/usr/local/bin/devin", "/bin/devin" };
+		private static readonly string[] LinuxPaths = { "/usr/bin/devin", "/usr/local/bin/devin", "/bin/devin" }; // Static: well-known linux install locations
 #endif
 
-		private static readonly string[] ManifestRelativePath = { "resources", "app", "package.json" };
+		private static readonly string[] ManifestRelativePath = { "resources", "app", "package.json" }; // Static: path segments to package.json inside the app bundle
 
 		public string Path { get; private set; }
 		public string Name { get; private set; }
@@ -42,7 +42,7 @@ namespace Unity.Devin.Editor
 		private static bool IsCandidateForDiscovery(string path)
 		{
 #if UNITY_EDITOR_WIN
-            return File.Exists(path) && Regex.IsMatch(path, ExePattern, RegexOptions.IgnoreCase);
+			return File.Exists(path) && Regex.IsMatch(path, ExePattern, RegexOptions.IgnoreCase);
 #elif UNITY_EDITOR_OSX
             return Directory.Exists(path) && Regex.IsMatch(path, AppPattern, RegexOptions.IgnoreCase);
 #else
@@ -64,7 +64,7 @@ namespace Unity.Devin.Editor
 
 			string manifestBase;
 #if UNITY_EDITOR_WIN
-            manifestBase = IOPath.GetDirectoryName(editorPath);
+			manifestBase = IOPath.GetDirectoryName(editorPath);
 #elif UNITY_EDITOR_OSX
             manifestBase = IOPath.Combine(editorPath, "Contents");
 #else
@@ -101,6 +101,7 @@ namespace Unity.Devin.Editor
 				Name = BuildDisplayName(version, isPrerelease),
 				Version = version ?? new Version(),
 			};
+
 			return true;
 		}
 
@@ -109,10 +110,10 @@ namespace Unity.Devin.Editor
 			var candidates = new List<string>();
 
 #if UNITY_EDITOR_WIN
-            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-            candidates.Add(IOPath.Combine(localAppData, "Programs", FolderName, ExeName));
-            candidates.Add(IOPath.Combine(programFiles, FolderName, ExeName));
+			var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+			var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+			candidates.Add(IOPath.Combine(localAppData, "Programs", FolderName, ExeName));
+			candidates.Add(IOPath.Combine(programFiles, FolderName, ExeName));
 #elif UNITY_EDITOR_OSX
             if (Directory.Exists(ApplicationsDir))
                 candidates.AddRange(Directory.EnumerateDirectories(ApplicationsDir, AppSearchPattern));
@@ -146,9 +147,10 @@ namespace Unity.Devin.Editor
 					UseShellExecute = false,
 				});
 			}
-			catch (Exception e)
+			catch (Exception exception)
 			{
-				UnityEngine.Debug.LogError($"[Devin] Failed to open file: {e.Message}");
+				UnityEngine.Debug.LogError($"[{nameof(DevinInstallation)}] Failed to open file: {exception.Message}");
+
 				return false;
 			}
 

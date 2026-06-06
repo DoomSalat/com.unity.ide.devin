@@ -1,6 +1,5 @@
 using System;
 using System.Linq;
-using System.Reflection;
 using UnityEditor;
 using UnityEngine;
 using UCE = Unity.CodeEditor.CodeEditor;
@@ -11,23 +10,20 @@ namespace Unity.Devin.Editor
 	[InitializeOnLoad]
 	public class DevinEditor : IExternalCodeEditor
 	{
-		// Reflection targets for SyncAll delegation
-		private const string SyncVsType = "UnityEditor.SyncVS,UnityEditor";
-		private const string SyncSolutionMethod = "SyncSolution";
-		private const string VsEditorType = "Microsoft.Unity.VisualStudio.Editor.VisualStudioEditor,Unity.VisualStudio.Editor";
-		private const string WindsurfEditorType = "Unity.VisualStudio.Editor.VisualStudioEditor,Unity.Windsurf.Editor";
-		private const string SyncAllMethod = "SyncAll";
-		private const string InstanceProperty = "Instance";
-
-		// EditorPrefs keys — which package types get .csproj files
 		private const string PrefEmbedded = "Devin_Generate_Embedded";
 		private const string PrefLocal = "Devin_Generate_Local";
 		private const string PrefRegistry = "Devin_Generate_Registry";
 		private const string PrefGit = "Devin_Generate_Git";
 		private const string PrefBuiltIn = "Devin_Generate_BuiltIn";
 		private const string PrefPlayerAssemblies = "Devin_Generate_Player";
+		private const string PrefUseCustomSolution = "Devin_Use_Custom_Solution";
+		private const string PrefCustomSolutionPath = "Devin_Custom_Solution_Path";
 
 		private const float ButtonWidth = 252f;
+
+		private static readonly string[] RelevantExtensions = { ".cs", ".asmdef", ".asmref", ".dll", ".rsp" }; // Static: immutable lookup table shared across calls
+
+		private static bool _isSyncing; // Static: re-entrancy guard
 
 		static DevinEditor()
 		{
@@ -75,6 +71,9 @@ namespace Unity.Devin.Editor
 			if (!IsDevinSelected())
 				return;
 
+			if (!HasRelevantChanges(addedFiles, deletedFiles, movedFiles, importedFiles))
+				return;
+
 			TrySyncSolution();
 		}
 
@@ -92,10 +91,38 @@ namespace Unity.Devin.Editor
 			EditorGUI.indentLevel++;
 			DrawToggle(PrefEmbedded, "Embedded packages", defaultValue: true);
 			DrawToggle(PrefLocal, "Local packages", defaultValue: true);
-			DrawToggle(PrefRegistry, "Registry packages", defaultValue: true);
+			DrawToggle(PrefRegistry, "Registry packages", defaultValue: false);
 			DrawToggle(PrefGit, "Git packages", defaultValue: true);
 			DrawToggle(PrefBuiltIn, "Built-in packages", defaultValue: false);
 			DrawToggle(PrefPlayerAssemblies, "Player projects", defaultValue: false);
+			EditorGUI.indentLevel--;
+
+			GUILayout.Space(4);
+
+			EditorGUILayout.LabelField("OmniSharp Solution:", EditorStyles.boldLabel);
+
+			EditorGUI.indentLevel++;
+			var useCustomSolution = EditorPrefs.GetBool(PrefUseCustomSolution, defaultValue: false);
+			var nextUseCustomSolution = EditorGUILayout.Toggle("Use custom solution path", useCustomSolution);
+
+			if (nextUseCustomSolution != useCustomSolution)
+				EditorPrefs.SetBool(PrefUseCustomSolution, nextUseCustomSolution);
+
+			if (nextUseCustomSolution)
+			{
+				var customPath = EditorPrefs.GetString(PrefCustomSolutionPath, "");
+				var nextCustomPath = EditorGUILayout.TextField("Solution path:", customPath);
+
+				if (nextCustomPath != customPath)
+					EditorPrefs.SetString(PrefCustomSolutionPath, nextCustomPath);
+
+				if (GUILayout.Button("Auto-detect solution path", GUILayout.Width(ButtonWidth)))
+				{
+					var detectedPath = AutoDetectSolutionPath();
+					if (!string.IsNullOrEmpty(detectedPath))
+						EditorPrefs.SetString(PrefCustomSolutionPath, detectedPath);
+				}
+			}
 			EditorGUI.indentLevel--;
 
 			GUILayout.Space(4);
@@ -108,6 +135,7 @@ namespace Unity.Devin.Editor
 		{
 			var current = EditorPrefs.GetBool(prefKey, defaultValue);
 			var next = EditorGUILayout.Toggle(label, current);
+
 			if (next != current)
 				EditorPrefs.SetBool(prefKey, next);
 		}
@@ -117,67 +145,89 @@ namespace Unity.Devin.Editor
 
 		private static void TrySyncSolution()
 		{
-			// Unity 2019–2022
-			if (TryInvokeStatic(SyncVsType, SyncSolutionMethod))
+			if (_isSyncing)
 				return;
 
-			// Unity 6+: delegate to com.unity.ide.visualstudio
-			if (TryInvokeInstanceMethod(VsEditorType, SyncAllMethod))
-				return;
+			_isSyncing = true;
 
-			// Windsurf fallback
-			TryInvokeInstanceMethod(WindsurfEditorType, SyncAllMethod);
-		}
-
-		private static bool TryInvokeStatic(string typeAssemblyName, string methodName)
-		{
 			try
 			{
-				var method = Type.GetType(typeAssemblyName)
-					?.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-
-				if (method == null)
-					return false;
-
-				method.Invoke(null, null);
-
-				return true;
+				ProjectGeneration.Sync(ReadFlag());
 			}
-			catch
+			finally
 			{
-				return false;
+				_isSyncing = false;
 			}
 		}
 
-		private static bool TryInvokeInstanceMethod(string typeAssemblyName, string methodName)
+		private static ProjectGenerationFlag ReadFlag()
 		{
-			try
+			var flag = ProjectGenerationFlag.None;
+
+			if (EditorPrefs.GetBool(PrefEmbedded, defaultValue: true))
+				flag |= ProjectGenerationFlag.Embedded;
+
+			if (EditorPrefs.GetBool(PrefLocal, defaultValue: true))
+				flag |= ProjectGenerationFlag.Local;
+
+			if (EditorPrefs.GetBool(PrefRegistry, defaultValue: false))
+				flag |= ProjectGenerationFlag.Registry;
+
+			if (EditorPrefs.GetBool(PrefGit, defaultValue: true))
+				flag |= ProjectGenerationFlag.Git;
+
+			if (EditorPrefs.GetBool(PrefBuiltIn, defaultValue: false))
+				flag |= ProjectGenerationFlag.BuiltIn;
+
+			if (EditorPrefs.GetBool(PrefPlayerAssemblies, defaultValue: false))
+				flag |= ProjectGenerationFlag.PlayerAssemblies;
+
+			return flag;
+		}
+
+		private static bool HasRelevantChanges(params string[][] fileSets)
+		{
+			foreach (var files in fileSets)
 			{
-				var type = Type.GetType(typeAssemblyName);
+				if (files == null)
+					continue;
 
-				if (type == null)
-					return false;
+				foreach (var file in files)
+				{
+					var extension = System.IO.Path.GetExtension(file);
 
-				var instance = type
-					.GetProperty(InstanceProperty, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
-					?.GetValue(null);
-
-				if (instance == null)
-					return false;
-
-				var method = type.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-
-				if (method == null)
-					return false;
-
-				method.Invoke(instance, null);
-
-				return true;
+					foreach (var relevant in RelevantExtensions)
+					{
+						if (string.Equals(extension, relevant, StringComparison.OrdinalIgnoreCase))
+							return true;
+					}
+				}
 			}
-			catch
+
+			return false;
+		}
+
+		private static string AutoDetectSolutionPath()
+		{
+			var projectPath = System.IO.Directory.GetCurrentDirectory();
+			var slnFiles = System.IO.Directory.GetFiles(projectPath, "*.sln");
+
+			if (slnFiles.Length > 0)
+				return slnFiles[0];
+
+			return "";
+		}
+
+		public static string GetSolutionPath()
+		{
+			if (EditorPrefs.GetBool(PrefUseCustomSolution, defaultValue: false))
 			{
-				return false;
+				var customPath = EditorPrefs.GetString(PrefCustomSolutionPath, "");
+				if (!string.IsNullOrEmpty(customPath) && System.IO.File.Exists(customPath))
+					return customPath;
 			}
+
+			return AutoDetectSolutionPath();
 		}
 	}
 }
