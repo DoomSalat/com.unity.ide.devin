@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using UnityEditor;
 using UnityEngine;
@@ -12,7 +13,17 @@ namespace Unity.Devin.Editor
 	{
 		private const float ButtonWidth = 252f;
 
+		// Extensions that trigger SyncIfNeeded (narrow: only project-structure-relevant files)
 		private static readonly string[] RelevantExtensions = { ".cs", ".asmdef", ".asmref", ".dll", ".rsp" };
+
+		// Extensions Devin should open; everything else (prefabs, materials, scenes…) stays in Unity
+		private static readonly HashSet<string> OpenableExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+		{
+			".cs", ".uxml", ".uss", ".shader", ".compute", ".cginc", ".hlsl", ".glslinc",
+			".template", ".raytrace", ".json", ".rsp", ".asmdef", ".asmref",
+			".xaml", ".tt", ".t4", ".ttinclude", ".dll", ".txt", ".md", ".xml",
+			".yaml", ".yml"
+		};
 
 		private static bool _isSyncing;
 
@@ -40,6 +51,13 @@ namespace Unity.Devin.Editor
 
 		public bool OpenProject(string path, int line, int column)
 		{
+			if (!string.IsNullOrEmpty(path))
+			{
+				var ext = System.IO.Path.GetExtension(path);
+				if (!string.IsNullOrEmpty(ext) && !OpenableExtensions.Contains(ext))
+					return false;
+			}
+
 			if (!DevinInstallation.TryDiscover(UCE.CurrentEditorInstallation, out var installation))
 				return false;
 
@@ -78,31 +96,108 @@ namespace Unity.Devin.Editor
 			if (!IsDevinSelected())
 				return;
 
-			var delegateEditor = ReflectedProjectSync.FindDelegate();
+			var allEditors = ReflectedProjectSync.GetAllEditors();
 
-			if (delegateEditor == null)
+			// — Delegate selector —
+			EditorGUILayout.LabelField("Project generation delegate:", EditorStyles.boldLabel);
+			EditorGUI.indentLevel++;
+
+			if (allEditors.Length == 0)
 			{
 				EditorGUILayout.HelpBox(
-					"No compatible editor found for project generation.\n" +
-					"Install Rider or VS Tools for Unity to enable .csproj generation.",
-					MessageType.Warning);
+					"No editor plugins found in the project.\n" +
+					"Add com.unity.ide.rider or com.unity.ide.visualstudio to Packages/manifest.json.",
+					MessageType.Error);
 			}
 			else
 			{
-				EditorGUILayout.LabelField("Project generation delegated to:", EditorStyles.boldLabel);
-				EditorGUI.indentLevel++;
-				EditorGUILayout.LabelField(delegateEditor.GetType().Name, EditorStyles.label);
-				EditorGUI.indentLevel--;
-				GUILayout.Space(4);
-				EditorGUILayout.HelpBox(
-					"Generation settings (package types, etc.) are controlled by the delegate editor's preferences.",
-					MessageType.Info);
+				var typeNames = allEditors.Select(e => e.GetType().FullName).ToArray();
+				var displayNames = allEditors.Select(e => e.GetType().Name).ToArray();
+				var savedType = EditorPrefs.GetString(ReflectedProjectSync.PrefDelegateEditorType, "");
+				var currentIndex = Math.Max(0, Array.IndexOf(typeNames, savedType));
+
+				var newIndex = EditorGUILayout.Popup(currentIndex, displayNames);
+				if (newIndex != currentIndex)
+				{
+					EditorPrefs.SetString(ReflectedProjectSync.PrefDelegateEditorType, typeNames[newIndex]);
+					ReflectedProjectSync.InvalidateCache();
+				}
+
+				var selected = allEditors[newIndex];
+				var installs = selected.Installations;
+				var hasInstall = installs != null && installs.Length > 0;
+
+				if (!hasInstall)
+					EditorGUILayout.HelpBox(
+						$"{selected.GetType().Name} is registered but the IDE is not installed on this machine.\n" +
+						"Project files will not be generated until a valid installation is found.",
+						MessageType.Warning);
+				else
+					EditorGUILayout.HelpBox(
+						"Generation settings are controlled by the selected delegate editor's preferences.",
+						MessageType.Info);
 			}
 
-			GUILayout.Space(4);
+			EditorGUI.indentLevel--;
+			GUILayout.Space(6);
+
+			// — File state —
+			EditorGUILayout.LabelField("Project file state:", EditorStyles.boldLabel);
+			EditorGUI.indentLevel++;
+			DrawFileStatus();
+			EditorGUI.indentLevel--;
+			GUILayout.Space(6);
 
 			if (GUILayout.Button("Regenerate project files", GUILayout.Width(ButtonWidth)))
 				SyncAll();
+		}
+
+		private static void DrawFileStatus()
+		{
+			var dir = System.IO.Path.GetDirectoryName(UnityEngine.Application.dataPath);
+			var projectName = System.IO.Path.GetFileName(dir);
+
+			var slnPath = System.IO.Path.Combine(dir, projectName + ".sln");
+			var omniPath = System.IO.Path.Combine(dir, "omnisharp.json");
+			var propsPath = System.IO.Path.Combine(dir, "Directory.Build.props");
+
+			DrawRow(".sln",               slnPath,   required: true);
+			DrawRow("omnisharp.json",     omniPath,  required: true,  contentCheck: c => c.Contains("\"solution\""));
+			DrawRow("Directory.Build.props", propsPath, required: false, contentCheck: c => c.Contains("SkipGetTargetFrameworkProperties"));
+		}
+
+		private static void DrawRow(string label, string path, bool required,
+			System.Func<string, bool> contentCheck = null)
+		{
+			bool exists = System.IO.File.Exists(path);
+			bool contentOk = true;
+
+			if (exists && contentCheck != null)
+				contentOk = contentCheck(System.IO.File.ReadAllText(path));
+
+			string status;
+			MessageType msgType;
+
+			if (!exists)
+			{
+				status = required ? $"{label} — missing" : $"{label} — not generated yet";
+				msgType = required ? MessageType.Warning : MessageType.Info;
+			}
+			else if (!contentOk)
+			{
+				status = $"{label} — exists but may be misconfigured";
+				msgType = MessageType.Warning;
+			}
+			else
+			{
+				status = $"{label} — OK";
+				msgType = MessageType.None;
+			}
+
+			if (msgType == MessageType.None)
+				EditorGUILayout.LabelField(status);
+			else
+				EditorGUILayout.HelpBox(status, msgType);
 		}
 
 		private static bool IsDevinSelected() =>

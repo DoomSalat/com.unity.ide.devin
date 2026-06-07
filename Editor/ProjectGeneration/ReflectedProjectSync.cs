@@ -14,35 +14,44 @@ namespace Unity.Devin.Editor
 {
 	internal static class ReflectedProjectSync
 	{
-		// Preference order: Rider generates SDK-style projects compatible with .NET Core SDK MSBuild.
-		// VS Tools generates old-style projects that require Visual Studio — listed as fallback only.
-		private static readonly string[] PreferredEditorNames =
-		{
-			"Rider",
-			"VisualStudioCode",
-			"VisualStudio",
-		};
+		internal const string PrefDelegateEditorType = "Devin_Delegate_Editor_Type";
+
+		// Auto-select priority when no preference is saved
+		private static readonly string[] PreferredEditorNames = { "Rider", "VisualStudioCode", "VisualStudio" };
 
 		private static IExternalCodeEditor _cachedDelegate;
+
+		public static IExternalCodeEditor[] GetAllEditors() =>
+			GetRegisteredEditors().Where(e => !(e is DevinEditor)).ToArray();
 
 		public static IExternalCodeEditor FindDelegate()
 		{
 			if (_cachedDelegate != null)
 				return _cachedDelegate;
 
-			var editors = GetRegisteredEditors();
+			var editors = GetAllEditors();
+			if (editors.Length == 0)
+				return null;
+
+			var savedType = UnityEditor.EditorPrefs.GetString(PrefDelegateEditorType, "");
+
+			if (!string.IsNullOrEmpty(savedType))
+			{
+				var saved = editors.FirstOrDefault(e => e.GetType().FullName == savedType);
+				if (saved != null)
+					return _cachedDelegate = saved;
+			}
 
 			foreach (var preferred in PreferredEditorNames)
 			{
 				var found = editors.FirstOrDefault(e =>
-					!(e is DevinEditor) &&
 					e.GetType().FullName?.IndexOf(preferred, StringComparison.OrdinalIgnoreCase) >= 0);
 
 				if (found != null)
 					return _cachedDelegate = found;
 			}
 
-			return _cachedDelegate = editors.FirstOrDefault(e => !(e is DevinEditor));
+			return _cachedDelegate = editors[0];
 		}
 
 		public static void InvalidateCache() => _cachedDelegate = null;
@@ -51,21 +60,104 @@ namespace Unity.Devin.Editor
 		{
 			if (delegateEditor == null)
 			{
-				Debug.LogWarning("[Devin] No compatible editor found for project generation. Install Rider or VS Tools for Unity.");
+				Debug.LogWarning("[Devin] No delegate editor selected for project generation.");
 				return false;
 			}
 
-			try
+			bool success;
+			var typeName = delegateEditor.GetType().FullName ?? "";
+
+			// VS Tools' SyncAll() bails early when Devin is the selected editor
+			// (it checks CodeEditor.CurrentEditorInstallation, gets Devin's path, finds no VS installation).
+			// Bypass by reflecting _discoverInstallations → first installation → ProjectGenerator.Sync().
+			if (typeName.IndexOf("VisualStudio", StringComparison.OrdinalIgnoreCase) >= 0)
+				success = TryInternalSyncVSTools(delegateEditor);
+			else
+				success = TrySyncAllDirect(delegateEditor);
+
+			if (success)
 			{
-				delegateEditor.SyncAll();
 				WriteOmniSharpSupport();
 				Debug.Log($"[Devin] Project files synced via {delegateEditor.GetType().Name}.");
+			}
+
+			return success;
+		}
+
+		private static bool TrySyncAllDirect(IExternalCodeEditor editor)
+		{
+			try
+			{
+				editor.SyncAll();
 				return true;
 			}
 			catch (Exception ex)
 			{
-				Debug.LogWarning($"[Devin] SyncAll via {delegateEditor.GetType().Name} failed: {ex.Message}");
+				Debug.LogWarning($"[Devin] SyncAll via {editor.GetType().Name} failed: {ex.Message}");
 				return false;
+			}
+		}
+
+		// Bypasses VS Tools' current-editor check by calling ProjectGenerator.Sync() directly.
+		// VS Tools stores installations in a static AsyncOperation<Dictionary<string, IVisualStudioInstallation>>.
+		private static bool TryInternalSyncVSTools(IExternalCodeEditor editor)
+		{
+			try
+			{
+				var editorType = editor.GetType();
+
+				var discoverField = editorType.GetField("_discoverInstallations",
+					BindingFlags.NonPublic | BindingFlags.Static);
+				if (discoverField == null)
+					return TrySyncAllDirect(editor);
+
+				var asyncOp = discoverField.GetValue(null);
+				if (asyncOp == null)
+					return TrySyncAllDirect(editor);
+
+				var resultProp = asyncOp.GetType().GetProperty("Result",
+					BindingFlags.Public | BindingFlags.Instance);
+				if (resultProp == null)
+					return TrySyncAllDirect(editor);
+
+				var dict = resultProp.GetValue(asyncOp) as IDictionary;
+				if (dict == null || dict.Count == 0)
+				{
+					Debug.LogWarning("[Devin] VS Tools: no installations discovered. Is Visual Studio installed?");
+					return false;
+				}
+
+				object firstInstallation = null;
+				foreach (var value in dict.Values)
+				{
+					firstInstallation = value;
+					break;
+				}
+
+				if (firstInstallation == null)
+					return false;
+
+				var generatorProp = firstInstallation.GetType().GetProperty("ProjectGenerator",
+					BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+				if (generatorProp == null)
+					return TrySyncAllDirect(editor);
+
+				var generator = generatorProp.GetValue(firstInstallation);
+				if (generator == null)
+					return false;
+
+				var syncMethod = generator.GetType().GetMethod("Sync",
+					BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+				if (syncMethod == null)
+					return TrySyncAllDirect(editor);
+
+				syncMethod.Invoke(generator, null);
+				return true;
+			}
+			catch (Exception ex)
+			{
+				Debug.LogWarning($"[Devin] VS Tools internal sync failed: {ex.Message}. Falling back to SyncAll.");
+				return TrySyncAllDirect(editor);
 			}
 		}
 
@@ -87,7 +179,6 @@ namespace Unity.Devin.Editor
 			}
 		}
 
-		// After delegate editor generates .csproj/.sln we write OmniSharp-specific support files.
 		private static void WriteOmniSharpSupport()
 		{
 			var projectDirectory = IOPath.GetDirectoryName(Application.dataPath);
@@ -99,16 +190,15 @@ namespace Unity.Devin.Editor
 
 		private static void WriteDirectoryBuildProps(string projectDirectory)
 		{
-			const string newline = "\r\n";
-
+			const string nl = "\r\n";
 			var content =
-				"<!-- Generated by Unity.Devin — do not edit manually -->" + newline +
-				"<Project>" + newline +
-				"  <PropertyGroup>" + newline +
-				"    <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>" + newline +
-				"    <NoRestore>true</NoRestore>" + newline +
-				"  </PropertyGroup>" + newline +
-				"</Project>" + newline;
+				"<!-- Generated by Unity.Devin — do not edit manually -->" + nl +
+				"<Project>" + nl +
+				"  <PropertyGroup>" + nl +
+				"    <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>" + nl +
+				"    <NoRestore>true</NoRestore>" + nl +
+				"  </PropertyGroup>" + nl +
+				"</Project>" + nl;
 
 			WriteIfChanged(IOPath.Combine(projectDirectory, "Directory.Build.props"), content);
 		}
@@ -116,7 +206,6 @@ namespace Unity.Devin.Editor
 		private static void WriteOmniSharpJson(string projectDirectory, string projectName)
 		{
 			var solutionPath = IOPath.Combine(projectDirectory, projectName + ".sln").Replace("\\", "\\\\");
-
 			var content =
 				"{\r\n" +
 				"  \"msbuild\": {\r\n" +
@@ -137,7 +226,6 @@ namespace Unity.Devin.Editor
 				"}";
 
 			var filePath = IOPath.Combine(projectDirectory, "omnisharp.json");
-
 			if (File.Exists(filePath))
 			{
 				var existing = File.ReadAllText(filePath);
@@ -160,26 +248,50 @@ namespace Unity.Devin.Editor
 		{
 			var codeEditorType = typeof(UCE);
 
-			// Unity stores registered editors in a private static list field.
-			// Field name varies by Unity version — iterate all static fields to find it.
-			foreach (var field in codeEditorType.GetFields(BindingFlags.NonPublic | BindingFlags.Static))
+			// Unity stores editors in an instance field on a static CodeEditor instance.
+			// Strategy: find the static CodeEditor instance first, then look for the list on it.
+			// Fallback: also scan static fields directly (older Unity versions).
+
+			var instances = new List<object> { null }; // null = search static fields
+
+			// Try public static property "Editor"
+			var editorProp = codeEditorType.GetProperty("Editor",
+				BindingFlags.Public | BindingFlags.Static);
+			if (editorProp != null)
+				instances.Insert(0, editorProp.GetValue(null));
+
+			// Try any static field of type CodeEditor
+			foreach (var f in codeEditorType.GetFields(BindingFlags.NonPublic | BindingFlags.Static))
 			{
-				if (!typeof(IEnumerable).IsAssignableFrom(field.FieldType))
-					continue;
+				if (f.FieldType == codeEditorType)
+					instances.Insert(0, f.GetValue(null));
+			}
 
-				var value = field.GetValue(null);
-				if (value is not IEnumerable enumerable)
-					continue;
+			foreach (var instance in instances)
+			{
+				var flags = instance != null
+					? BindingFlags.NonPublic | BindingFlags.Instance
+					: BindingFlags.NonPublic | BindingFlags.Static;
 
-				var result = new List<IExternalCodeEditor>();
-				foreach (var item in enumerable)
+				foreach (var field in codeEditorType.GetFields(flags))
 				{
-					if (item is IExternalCodeEditor editor)
-						result.Add(editor);
-				}
+					if (!typeof(IEnumerable).IsAssignableFrom(field.FieldType))
+						continue;
 
-				if (result.Count > 0)
-					return result.ToArray();
+					var value = field.GetValue(instance);
+					if (value is not IEnumerable enumerable)
+						continue;
+
+					var result = new List<IExternalCodeEditor>();
+					foreach (var item in enumerable)
+					{
+						if (item is IExternalCodeEditor editor)
+							result.Add(editor);
+					}
+
+					if (result.Count > 0)
+						return result.ToArray();
+				}
 			}
 
 			return Array.Empty<IExternalCodeEditor>();
