@@ -165,6 +165,7 @@ namespace Unity.Devin.Editor
 			if (delegateEditor == null)
 				return false;
 
+			bool synced = false;
 			var typeName = delegateEditor.GetType().FullName ?? "";
 
 			// VS Tools' SyncIfNeeded has the same current-editor guard as SyncAll.
@@ -185,7 +186,7 @@ namespace Unity.Devin.Editor
 						{
 							var affected = ConcatArrays(added, deleted, moved, movedFrom);
 							method.Invoke(generator, new object[] { affected, (IEnumerable<string>)(imported ?? Array.Empty<string>()) });
-							return true;
+							synced = true;
 						}
 					}
 				}
@@ -195,15 +196,44 @@ namespace Unity.Devin.Editor
 				}
 			}
 
+			if (!synced)
+			{
+				try
+				{
+					delegateEditor.SyncIfNeeded(added, deleted, moved, movedFrom, imported);
+					synced = true;
+				}
+				catch (Exception ex)
+				{
+					Debug.LogWarning($"[Devin] SyncIfNeeded via {delegateEditor.GetType().Name} failed: {ex.Message}");
+				}
+			}
+
+			// SDK-style .csproj includes files via glob — the delegate may not modify the .csproj
+			// at all when a new .cs file is added. Touch all .csproj files so OmniSharp re-evaluates
+			// the glob and discovers the new file without requiring a manual restart.
+			if (synced && HasAddedOrDeleted(added, deleted))
+				TouchCsprojFiles(IOPath.GetDirectoryName(Application.dataPath));
+
+			return synced;
+		}
+
+		private static bool HasAddedOrDeleted(string[] added, string[] deleted)
+		{
+			return (added != null && added.Length > 0) || (deleted != null && deleted.Length > 0);
+		}
+
+		private static void TouchCsprojFiles(string projectDirectory)
+		{
+			var now = DateTime.UtcNow;
 			try
 			{
-				delegateEditor.SyncIfNeeded(added, deleted, moved, movedFrom, imported);
-				return true;
+				foreach (var csproj in Directory.GetFiles(projectDirectory, "*.csproj"))
+					File.SetLastWriteTimeUtc(csproj, now);
 			}
 			catch (Exception ex)
 			{
-				Debug.LogWarning($"[Devin] SyncIfNeeded via {delegateEditor.GetType().Name} failed: {ex.Message}");
-				return false;
+				Debug.LogWarning($"[Devin] Failed to touch .csproj files: {ex.Message}");
 			}
 		}
 
