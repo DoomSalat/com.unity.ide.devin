@@ -104,47 +104,9 @@ namespace Unity.Devin.Editor
 		{
 			try
 			{
-				var editorType = editor.GetType();
-
-				var discoverField = editorType.GetField("_discoverInstallations",
-					BindingFlags.NonPublic | BindingFlags.Static);
-				if (discoverField == null)
-					return TrySyncAllDirect(editor);
-
-				var asyncOp = discoverField.GetValue(null);
-				if (asyncOp == null)
-					return TrySyncAllDirect(editor);
-
-				var resultProp = asyncOp.GetType().GetProperty("Result",
-					BindingFlags.Public | BindingFlags.Instance);
-				if (resultProp == null)
-					return TrySyncAllDirect(editor);
-
-				var dict = resultProp.GetValue(asyncOp) as IDictionary;
-				if (dict == null || dict.Count == 0)
-				{
-					Debug.LogWarning("[Devin] VS Tools: no installations discovered. Is Visual Studio installed?");
-					return false;
-				}
-
-				object firstInstallation = null;
-				foreach (var value in dict.Values)
-				{
-					firstInstallation = value;
-					break;
-				}
-
-				if (firstInstallation == null)
-					return false;
-
-				var generatorProp = firstInstallation.GetType().GetProperty("ProjectGenerator",
-					BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-				if (generatorProp == null)
-					return TrySyncAllDirect(editor);
-
-				var generator = generatorProp.GetValue(firstInstallation);
+				var generator = GetVSToolsGenerator(editor);
 				if (generator == null)
-					return false;
+					return TrySyncAllDirect(editor);
 
 				var syncMethod = generator.GetType().GetMethod("Sync",
 					BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
@@ -161,11 +123,77 @@ namespace Unity.Devin.Editor
 			}
 		}
 
+		// Returns the IGenerator from the first discovered VS installation, or null on failure.
+		private static object GetVSToolsGenerator(IExternalCodeEditor editor)
+		{
+			var discoverField = editor.GetType().GetField("_discoverInstallations",
+				BindingFlags.NonPublic | BindingFlags.Static);
+			if (discoverField == null)
+				return null;
+
+			var asyncOp = discoverField.GetValue(null);
+			if (asyncOp == null)
+				return null;
+
+			var resultProp = asyncOp.GetType().GetProperty("Result", BindingFlags.Public | BindingFlags.Instance);
+			if (resultProp == null)
+				return null;
+
+			var dict = resultProp.GetValue(asyncOp) as IDictionary;
+			if (dict == null || dict.Count == 0)
+			{
+				Debug.LogWarning("[Devin] VS Tools: no installations discovered. Is Visual Studio installed?");
+				return null;
+			}
+
+			object firstInstallation = null;
+			foreach (var value in dict.Values) { firstInstallation = value; break; }
+			if (firstInstallation == null)
+				return null;
+
+			var generatorProp = firstInstallation.GetType().GetProperty("ProjectGenerator",
+				BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+			if (generatorProp == null)
+				return null;
+
+			return generatorProp.GetValue(firstInstallation);
+		}
+
 		public static bool TrySyncIfNeeded(IExternalCodeEditor delegateEditor,
 			string[] added, string[] deleted, string[] moved, string[] movedFrom, string[] imported)
 		{
 			if (delegateEditor == null)
 				return false;
+
+			var typeName = delegateEditor.GetType().FullName ?? "";
+
+			// VS Tools' SyncIfNeeded has the same current-editor guard as SyncAll.
+			// IGenerator.SyncIfNeeded(affectedFiles, reimportedFiles) bypasses it directly.
+			if (typeName.IndexOf("VisualStudio", StringComparison.OrdinalIgnoreCase) >= 0)
+			{
+				try
+				{
+					var generator = GetVSToolsGenerator(delegateEditor);
+					if (generator != null)
+					{
+						// IGenerator.SyncIfNeeded(IEnumerable<string> affectedFiles, IEnumerable<string> reimportedFiles)
+						var method = generator.GetType().GetMethod("SyncIfNeeded",
+							BindingFlags.Public | BindingFlags.Instance, null,
+							new[] { typeof(IEnumerable<string>), typeof(IEnumerable<string>) }, null);
+
+						if (method != null)
+						{
+							var affected = ConcatArrays(added, deleted, moved, movedFrom);
+							method.Invoke(generator, new object[] { affected, (IEnumerable<string>)(imported ?? Array.Empty<string>()) });
+							return true;
+						}
+					}
+				}
+				catch (Exception ex)
+				{
+					Debug.LogWarning($"[Devin] VS Tools internal SyncIfNeeded failed: {ex.Message}. Falling back.");
+				}
+			}
 
 			try
 			{
@@ -176,6 +204,15 @@ namespace Unity.Devin.Editor
 			{
 				Debug.LogWarning($"[Devin] SyncIfNeeded via {delegateEditor.GetType().Name} failed: {ex.Message}");
 				return false;
+			}
+		}
+
+		private static IEnumerable<string> ConcatArrays(params string[][] arrays)
+		{
+			foreach (var arr in arrays)
+			{
+				if (arr == null) continue;
+				foreach (var s in arr) yield return s;
 			}
 		}
 

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEditor;
+using UnityEditor.Callbacks;
 using UnityEngine;
 using UCE = Unity.CodeEditor.CodeEditor;
 using IExternalCodeEditor = Unity.CodeEditor.IExternalCodeEditor;
@@ -90,6 +91,23 @@ namespace Unity.Devin.Editor
 		}
 
 		public void CreateIfDoesntExist() { }
+
+		[DidReloadScripts]
+		private static void OnScriptsReloaded()
+		{
+			if (!IsDevinSelected())
+				return;
+
+			// Full sync only when solution is missing — first launch or deleted files.
+			// Otherwise SyncIfNeeded handles incremental updates, so we don't disturb
+			// an in-progress OmniSharp load by rewriting files that haven't changed.
+			var dir = System.IO.Path.GetDirectoryName(Application.dataPath);
+			var projectName = System.IO.Path.GetFileName(dir);
+			var slnPath = System.IO.Path.Combine(dir, projectName + ".sln");
+
+			if (!System.IO.File.Exists(slnPath))
+				TrySyncSolution(full: true);
+		}
 
 		public void OnGUI()
 		{
