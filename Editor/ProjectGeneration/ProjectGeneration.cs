@@ -38,12 +38,15 @@ namespace Unity.Devin.Editor
 				}
 			}
 
+			var writtenCount = 0;
+
 			foreach (var assembly in assemblies)
 			{
 				var projectFilePath = IOPath.Combine(projectDirectory, assembly.name + ".csproj");
 				var content = BuildProjectText(assembly, includedNames, projectDirectory);
 
-				File.WriteAllText(projectFilePath, content, Encoding.UTF8);
+				if (WriteIfChanged(projectFilePath, content))
+					writtenCount++;
 			}
 
 			var solutionPath = IOPath.Combine(projectDirectory, projectName + ".sln");
@@ -62,11 +65,11 @@ namespace Unity.Devin.Editor
 				File.Delete(staleSolutionX);
 			}
 
-			File.WriteAllText(solutionPath, BuildSolutionText(assemblies), Encoding.UTF8);
-			File.WriteAllText(directoryBuildPropsPath, BuildDirectoryBuildProps(), Encoding.UTF8);
+			WriteIfChanged(solutionPath, BuildSolutionText(assemblies));
+			WriteIfChanged(directoryBuildPropsPath, BuildDirectoryBuildProps());
 			WriteOmniSharpJson(projectDirectory);
 
-			Debug.Log($"[{nameof(ProjectGeneration)}] Generated {assemblies.Length} project files.");
+			Debug.Log($"[{nameof(ProjectGeneration)}] Synced {assemblies.Length} projects ({writtenCount} updated).");
 		}
 
 		private static CompAssembly[] GatherAssemblies(ProjectGenerationFlag flag, string projectDirectory)
@@ -221,6 +224,15 @@ namespace Unity.Devin.Editor
 			}
 
 			stringBuilder.Append(@"  </ItemGroup>").Append(Newline);
+		}
+
+		private static bool WriteIfChanged(string filePath, string content)
+		{
+			if (File.Exists(filePath) && File.ReadAllText(filePath, Encoding.UTF8) == content)
+				return false;
+
+			File.WriteAllText(filePath, content, Encoding.UTF8);
+			return true;
 		}
 
 		private static void WriteOmniSharpJson(string projectDirectory)
