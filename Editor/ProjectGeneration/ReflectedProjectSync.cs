@@ -16,10 +16,29 @@ namespace Unity.Devin.Editor
 	{
 		internal const string PrefDelegateEditorType = "Devin_Delegate_Editor_Type";
 
+		private const string VisualStudio = "VisualStudio";
+		private const string DiscoverInstallationsField = "_discoverInstallations";
+		private const string VsWhereRelativePath = "Editor\\VSWhere\\vswhere.exe";
+		private const string VsForWinTypeName = "Microsoft.Unity.VisualStudio.Editor.VisualStudioForWindowsInstallation";
+		private const string TryDiscoverInstallationMethod = "TryDiscoverInstallation";
+		private const string VsWhereArguments = "-latest -property installationPath";
+		private const string DevenvRelativePath = "Common7\\IDE\\devenv.exe";
+		private const string SyncIfNeededMethod = "SyncIfNeeded";
+		private const string CsprojPattern = "*.csproj";
+		private const string SolutionExtension = ".sln";
+		private const string OmniSharpJsonFileName = "omnisharp.json";
+		private const string DirectoryBuildPropsFileName = "Directory.Build.props";
+		private const string EditorPropertyName = "Editor";
+		private const string SolutionJsonKey = "solution";
+		private const string LoadProjectsOnDemandJsonKey = "loadProjectsOnDemand";
+		private const string ResultPropertyName = "Result";
+		private const string ProjectGeneratorPropertyName = "ProjectGenerator";
+
 		// Auto-select priority when no preference is saved
 		private static readonly string[] PreferredEditorNames = { "Rider", "VisualStudioCode", "VisualStudio" };
 
 		private static IExternalCodeEditor _cachedDelegate;
+		private static bool? _vsFoundViaFallback;
 
 		public static IExternalCodeEditor[] GetAllEditors() =>
 			GetRegisteredEditors().Where(e => !(e is DevinEditor)).ToArray();
@@ -54,7 +73,23 @@ namespace Unity.Devin.Editor
 			return _cachedDelegate = editors[0];
 		}
 
-		public static void InvalidateCache() => _cachedDelegate = null;
+		public static void InvalidateCache()
+		{
+			_cachedDelegate = null;
+			_vsFoundViaFallback = null;
+		}
+
+		// Cached check: did the vswhere fallback find VS on the last attempt?
+		// null = not yet checked (run on first GUI repaint for VS delegate).
+		// Runs vswhere once, then caches; reset on InvalidateCache().
+		public static bool? VsFoundViaFallback(Assembly vsAssembly)
+		{
+			if (_vsFoundViaFallback.HasValue)
+				return _vsFoundViaFallback;
+
+			_vsFoundViaFallback = GetGeneratorViaVsWhere(vsAssembly) != null;
+			return _vsFoundViaFallback;
+		}
 
 		public static bool TrySync(IExternalCodeEditor delegateEditor)
 		{
@@ -70,7 +105,7 @@ namespace Unity.Devin.Editor
 			// VS Tools' SyncAll() bails early when Devin is the selected editor
 			// (it checks CodeEditor.CurrentEditorInstallation, gets Devin's path, finds no VS installation).
 			// Bypass by reflecting _discoverInstallations → first installation → ProjectGenerator.Sync().
-			if (typeName.IndexOf("VisualStudio", StringComparison.OrdinalIgnoreCase) >= 0)
+			if (typeName.IndexOf(VisualStudio, StringComparison.OrdinalIgnoreCase) >= 0)
 				success = TryInternalSyncVSTools(delegateEditor);
 			else
 				success = TrySyncAllDirect(delegateEditor);
@@ -124,9 +159,20 @@ namespace Unity.Devin.Editor
 		}
 
 		// Returns the IGenerator from the first discovered VS installation, or null on failure.
+		// Fast path: uses VS plugin's own async discovery result.
+		// Fallback: VS plugin's GetPackageAssetFullPath is broken on Unity < 6000.5 (uses
+		// Path.GetFullPath instead of FileUtil.PathToAbsolutePath, resolves vswhere.exe to a
+		// non-existent CWD-relative path). We bypass it by finding vswhere.exe via
+		// PackageInfo.resolvedPath, which is always correct regardless of Unity version.
 		private static object GetVSToolsGenerator(IExternalCodeEditor editor)
 		{
-			var discoverField = editor.GetType().GetField("_discoverInstallations",
+			return GetGeneratorFromDiscovery(editor)
+				?? GetGeneratorViaVsWhere(editor.GetType().Assembly);
+		}
+
+		private static object GetGeneratorFromDiscovery(IExternalCodeEditor editor)
+		{
+			var discoverField = editor.GetType().GetField(DiscoverInstallationsField,
 				BindingFlags.NonPublic | BindingFlags.Static);
 			if (discoverField == null)
 				return null;
@@ -135,28 +181,92 @@ namespace Unity.Devin.Editor
 			if (asyncOp == null)
 				return null;
 
-			var resultProp = asyncOp.GetType().GetProperty("Result", BindingFlags.Public | BindingFlags.Instance);
+			var resultProp = asyncOp.GetType().GetProperty(ResultPropertyName, BindingFlags.Public | BindingFlags.Instance);
 			if (resultProp == null)
 				return null;
 
 			var dict = resultProp.GetValue(asyncOp) as IDictionary;
 			if (dict == null || dict.Count == 0)
-			{
-				Debug.LogWarning("[Devin] VS Tools: no installations discovered. Is Visual Studio installed?");
 				return null;
-			}
 
 			object firstInstallation = null;
 			foreach (var value in dict.Values) { firstInstallation = value; break; }
-			if (firstInstallation == null)
+
+			return ExtractGenerator(firstInstallation);
+		}
+
+		private static object GetGeneratorViaVsWhere(Assembly vsAssembly)
+		{
+			var packageInfo = UnityEditor.PackageManager.PackageInfo.FindForAssembly(vsAssembly);
+			if (packageInfo == null)
 				return null;
 
-			var generatorProp = firstInstallation.GetType().GetProperty("ProjectGenerator",
-				BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-			if (generatorProp == null)
+			var vswhereExe = IOPath.Combine(packageInfo.resolvedPath, VsWhereRelativePath);
+			if (!File.Exists(vswhereExe))
 				return null;
 
-			return generatorProp.GetValue(firstInstallation);
+			var devenvPath = RunVsWhere(vswhereExe);
+			if (string.IsNullOrEmpty(devenvPath))
+			{
+				Debug.LogWarning("[Devin] vswhere found no Visual Studio installations.");
+				return null;
+			}
+
+			var vsForWinType = vsAssembly.GetType(VsForWinTypeName);
+			var discoverMethod = vsForWinType?.GetMethod(TryDiscoverInstallationMethod,
+				BindingFlags.Public | BindingFlags.Static);
+			if (discoverMethod == null)
+				return null;
+
+			var args = new object[] { devenvPath, null };
+			if (!(bool)discoverMethod.Invoke(null, args) || args[1] == null)
+				return null;
+
+			var generator = ExtractGenerator(args[1]);
+			if (generator != null)
+				Debug.Log("[Devin] VS discovery fallback succeeded via vswhere.");
+
+			return generator;
+		}
+
+		private static object ExtractGenerator(object installation)
+		{
+			if (installation == null)
+				return null;
+
+			return installation.GetType()
+				.GetProperty(ProjectGeneratorPropertyName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+				?.GetValue(installation);
+		}
+
+		private static string RunVsWhere(string vswhereExe)
+		{
+			try
+			{
+				var psi = new System.Diagnostics.ProcessStartInfo
+				{
+					FileName = vswhereExe,
+					Arguments = "-latest -property installationPath",
+					UseShellExecute = false,
+					RedirectStandardOutput = true,
+					CreateNoWindow = true
+				};
+
+				using var proc = System.Diagnostics.Process.Start(psi);
+				var installPath = proc?.StandardOutput.ReadToEnd().Trim();
+				proc?.WaitForExit();
+
+				if (string.IsNullOrEmpty(installPath))
+					return null;
+
+				var devenv = IOPath.Combine(installPath, DevenvRelativePath);
+				return File.Exists(devenv) ? devenv : null;
+			}
+			catch (Exception ex)
+			{
+				Debug.LogWarning($"[Devin] vswhere execution failed: {ex.Message}");
+				return null;
+			}
 		}
 
 		public static bool TrySyncIfNeeded(IExternalCodeEditor delegateEditor,
@@ -170,7 +280,7 @@ namespace Unity.Devin.Editor
 
 			// VS Tools' SyncIfNeeded has the same current-editor guard as SyncAll.
 			// IGenerator.SyncIfNeeded(affectedFiles, reimportedFiles) bypasses it directly.
-			if (typeName.IndexOf("VisualStudio", StringComparison.OrdinalIgnoreCase) >= 0)
+			if (typeName.IndexOf(VisualStudio, StringComparison.OrdinalIgnoreCase) >= 0)
 			{
 				try
 				{
@@ -178,7 +288,7 @@ namespace Unity.Devin.Editor
 					if (generator != null)
 					{
 						// IGenerator.SyncIfNeeded(IEnumerable<string> affectedFiles, IEnumerable<string> reimportedFiles)
-						var method = generator.GetType().GetMethod("SyncIfNeeded",
+						var method = generator.GetType().GetMethod(SyncIfNeededMethod,
 							BindingFlags.Public | BindingFlags.Instance, null,
 							new[] { typeof(IEnumerable<string>), typeof(IEnumerable<string>) }, null);
 
@@ -228,7 +338,7 @@ namespace Unity.Devin.Editor
 			var now = DateTime.UtcNow;
 			try
 			{
-				foreach (var csproj in Directory.GetFiles(projectDirectory, "*.csproj"))
+				foreach (var csproj in Directory.GetFiles(projectDirectory, CsprojPattern))
 					File.SetLastWriteTimeUtc(csproj, now);
 			}
 			catch (Exception ex)
@@ -267,12 +377,12 @@ namespace Unity.Devin.Editor
 				"  </PropertyGroup>" + nl +
 				"</Project>" + nl;
 
-			WriteIfChanged(IOPath.Combine(projectDirectory, "Directory.Build.props"), content);
+			WriteIfChanged(IOPath.Combine(projectDirectory, DirectoryBuildPropsFileName), content);
 		}
 
 		private static void WriteOmniSharpJson(string projectDirectory, string projectName)
 		{
-			var solutionPath = IOPath.Combine(projectDirectory, projectName + ".sln").Replace("\\", "\\\\");
+			var solutionPath = IOPath.Combine(projectDirectory, projectName + SolutionExtension).Replace("\\", "\\\\");
 			var content =
 				"{\r\n" +
 				"  \"msbuild\": {\r\n" +
@@ -292,11 +402,11 @@ namespace Unity.Devin.Editor
 				"  }\r\n" +
 				"}";
 
-			var filePath = IOPath.Combine(projectDirectory, "omnisharp.json");
+			var filePath = IOPath.Combine(projectDirectory, OmniSharpJsonFileName);
 			if (File.Exists(filePath))
 			{
 				var existing = File.ReadAllText(filePath);
-				if (existing.Contains("\"solution\"") && existing.Contains("loadProjectsOnDemand"))
+				if (existing.Contains("\"" + SolutionJsonKey + "\"") && existing.Contains(LoadProjectsOnDemandJsonKey))
 					return;
 			}
 
@@ -322,7 +432,7 @@ namespace Unity.Devin.Editor
 			var instances = new List<object> { null }; // null = search static fields
 
 			// Try public static property "Editor"
-			var editorProp = codeEditorType.GetProperty("Editor",
+			var editorProp = codeEditorType.GetProperty(EditorPropertyName,
 				BindingFlags.Public | BindingFlags.Static);
 			if (editorProp != null)
 				instances.Insert(0, editorProp.GetValue(null));
