@@ -16,29 +16,24 @@ namespace Unity.Devin.Editor
 	{
 		internal const string PrefDelegateEditorType = "Devin_Delegate_Editor_Type";
 
-		private const string VisualStudio = "VisualStudio";
 		private const string DiscoverInstallationsField = "_discoverInstallations";
-		private const string VsWhereRelativePath = "Editor\\VSWhere\\vswhere.exe";
-		private const string VsForWinTypeName = "Microsoft.Unity.VisualStudio.Editor.VisualStudioForWindowsInstallation";
-		private const string TryDiscoverInstallationMethod = "TryDiscoverInstallation";
-		private const string VsWhereArguments = "-latest -property installationPath";
-		private const string DevenvRelativePath = "Common7\\IDE\\devenv.exe";
 		private const string SyncIfNeededMethod = "SyncIfNeeded";
 		private const string CsprojPattern = "*.csproj";
 		private const string SolutionExtension = ".sln";
+		private const string SolutionXExtension = ".slnx";
 		private const string OmniSharpJsonFileName = "omnisharp.json";
 		private const string DirectoryBuildPropsFileName = "Directory.Build.props";
 		private const string EditorPropertyName = "Editor";
-		private const string SolutionJsonKey = "solution";
-		private const string LoadProjectsOnDemandJsonKey = "loadProjectsOnDemand";
 		private const string ResultPropertyName = "Result";
 		private const string ProjectGeneratorPropertyName = "ProjectGenerator";
+		private const string GeneratorFactoryTypeName = "Microsoft.Unity.VisualStudio.Editor.GeneratorFactory";
+		private const string GeneratorStyleTypeName = "Microsoft.Unity.VisualStudio.Editor.GeneratorStyle";
+		private const int GeneratorStyleLegacy = 2; // GeneratorStyle.Legacy enum value
 
 		// Auto-select priority when no preference is saved
 		private static readonly string[] PreferredEditorNames = { "Rider", "VisualStudioCode", "VisualStudio" };
 
 		private static IExternalCodeEditor _cachedDelegate;
-		private static bool? _vsFoundViaFallback;
 
 		public static IExternalCodeEditor[] GetAllEditors() =>
 			GetRegisteredEditors().Where(e => !(e is DevinEditor)).ToArray();
@@ -76,19 +71,6 @@ namespace Unity.Devin.Editor
 		public static void InvalidateCache()
 		{
 			_cachedDelegate = null;
-			_vsFoundViaFallback = null;
-		}
-
-		// Cached check: did the vswhere fallback find VS on the last attempt?
-		// null = not yet checked (run on first GUI repaint for VS delegate).
-		// Runs vswhere once, then caches; reset on InvalidateCache().
-		public static bool? VsFoundViaFallback(Assembly vsAssembly)
-		{
-			if (_vsFoundViaFallback.HasValue)
-				return _vsFoundViaFallback;
-
-			_vsFoundViaFallback = GetGeneratorViaVsWhere(vsAssembly) != null;
-			return _vsFoundViaFallback;
 		}
 
 		public static bool TrySync(IExternalCodeEditor delegateEditor)
@@ -100,23 +82,44 @@ namespace Unity.Devin.Editor
 			}
 
 			bool success;
-			var typeName = delegateEditor.GetType().FullName ?? "";
 
-			// VS Tools' SyncAll() bails early when Devin is the selected editor
-			// (it checks CodeEditor.CurrentEditorInstallation, gets Devin's path, finds no VS installation).
-			// Bypass by reflecting _discoverInstallations → first installation → ProjectGenerator.Sync().
-			if (typeName.IndexOf(VisualStudio, StringComparison.OrdinalIgnoreCase) >= 0)
-				success = TryInternalSyncVSTools(delegateEditor);
-			else
+			// Always try generator path first — bypasses the current-editor guard in SyncAll()
+			// that all VS-family plugins (VS Tools, Cursor, Windsurf, VSCode) use.
+			// Falls back to SyncAll() only when no generator is accessible (e.g. Rider).
+			success = TryInternalSyncVSTools(delegateEditor);
+			if (!success)
 				success = TrySyncAllDirect(delegateEditor);
 
 			if (success)
 			{
-				WriteOmniSharpSupport();
-				Debug.Log($"[Devin] Project files synced via {delegateEditor.GetType().Name}.");
+				var solutionPath = FindGeneratedSolutionPath();
+				if (solutionPath == null)
+				{
+					Debug.LogWarning("[Devin] Sync reported success but no .sln/.slnx found. Project generation may have silently failed.");
+					return false;
+				}
+
+				WriteOmniSharpSupport(solutionPath);
+				Debug.Log($"[Devin] Project files synced via {delegateEditor.GetType().Name}. Solution: {solutionPath}");
 			}
 
 			return success;
+		}
+
+		private static string FindGeneratedSolutionPath()
+		{
+			var dir = IOPath.GetDirectoryName(Application.dataPath);
+			var projectName = IOPath.GetFileName(dir);
+
+			var slnPath = IOPath.Combine(dir, projectName + SolutionExtension);
+			if (File.Exists(slnPath))
+				return slnPath;
+
+			var slnxPath = IOPath.Combine(dir, projectName + SolutionXExtension);
+			if (File.Exists(slnxPath))
+				return slnxPath;
+
+			return null;
 		}
 
 		private static bool TrySyncAllDirect(IExternalCodeEditor editor)
@@ -137,37 +140,52 @@ namespace Unity.Devin.Editor
 		// VS Tools stores installations in a static AsyncOperation<Dictionary<string, IVisualStudioInstallation>>.
 		private static bool TryInternalSyncVSTools(IExternalCodeEditor editor)
 		{
+			var generator = GetVSToolsGenerator(editor);
+			if (generator == null)
+				return false;
+
+			var syncMethod = generator.GetType().GetMethod("Sync",
+				BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+			if (syncMethod == null)
+			{
+				Debug.LogWarning($"[Devin] VS Tools generator type {generator.GetType().FullName} has no Sync() method.");
+				return false;
+			}
+
 			try
 			{
-				var generator = GetVSToolsGenerator(editor);
-				if (generator == null)
-					return TrySyncAllDirect(editor);
-
-				var syncMethod = generator.GetType().GetMethod("Sync",
-					BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
-				if (syncMethod == null)
-					return TrySyncAllDirect(editor);
-
 				syncMethod.Invoke(generator, null);
 				return true;
 			}
 			catch (Exception ex)
 			{
-				Debug.LogWarning($"[Devin] VS Tools internal sync failed: {ex.Message}. Falling back to SyncAll.");
-				return TrySyncAllDirect(editor);
+				var inner = (ex as System.Reflection.TargetInvocationException)?.InnerException ?? ex;
+				Debug.LogWarning($"[Devin] VS Tools Sync() threw: {inner.GetType().Name}: {inner.Message}");
+				return false;
 			}
 		}
 
-		// Returns the IGenerator from the first discovered VS installation, or null on failure.
-		// Fast path: uses VS plugin's own async discovery result.
-		// Fallback: VS plugin's GetPackageAssetFullPath is broken on Unity < 6000.5 (uses
-		// Path.GetFullPath instead of FileUtil.PathToAbsolutePath, resolves vswhere.exe to a
-		// non-existent CWD-relative path). We bypass it by finding vswhere.exe via
-		// PackageInfo.resolvedPath, which is always correct regardless of Unity version.
+		private static bool IsVSToolsAssembly(Assembly assembly) =>
+			assembly.GetType(GeneratorFactoryTypeName) != null;
+
+		// Returns an IGenerator from the editor's assembly, bypassing the current-editor guard in SyncAll().
+		// All VS-family plugins (VS Tools, Cursor, Windsurf, VS Code) store generators in static fields
+		// on their installation classes. We try three paths in order:
+		//   1. _discoverInstallations  — works when the IDE is installed and discovered
+		//   2. GeneratorFactory        — VS Tools only (Legacy style → .sln)
+		//   3. Static IGenerator scan  — catches Cursor/VSCode pattern (_generator field)
 		private static object GetVSToolsGenerator(IExternalCodeEditor editor)
 		{
-			return GetGeneratorFromDiscovery(editor)
-				?? GetGeneratorViaVsWhere(editor.GetType().Assembly);
+			var vsAssembly = editor.GetType().Assembly;
+
+			var fromDiscovery = GetGeneratorFromDiscovery(editor);
+			if (fromDiscovery != null)
+				return fromDiscovery;
+
+			if (IsVSToolsAssembly(vsAssembly))
+				return GetGeneratorViaFactory(vsAssembly);
+
+			return GetGeneratorFromStaticField(vsAssembly);
 		}
 
 		private static object GetGeneratorFromDiscovery(IExternalCodeEditor editor)
@@ -192,81 +210,112 @@ namespace Unity.Devin.Editor
 			object firstInstallation = null;
 			foreach (var value in dict.Values) { firstInstallation = value; break; }
 
-			return ExtractGenerator(firstInstallation);
+			return firstInstallation?.GetType()
+				.GetProperty(ProjectGeneratorPropertyName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+				?.GetValue(firstInstallation);
 		}
 
-		private static object GetGeneratorViaVsWhere(Assembly vsAssembly)
+		private static object GetGeneratorViaFactory(Assembly vsAssembly)
 		{
-			var packageInfo = UnityEditor.PackageManager.PackageInfo.FindForAssembly(vsAssembly);
-			if (packageInfo == null)
-				return null;
-
-			var vswhereExe = IOPath.Combine(packageInfo.resolvedPath, VsWhereRelativePath);
-			if (!File.Exists(vswhereExe))
-				return null;
-
-			var devenvPath = RunVsWhere(vswhereExe);
-			if (string.IsNullOrEmpty(devenvPath))
+			var factoryType = vsAssembly.GetType(GeneratorFactoryTypeName);
+			if (factoryType == null)
 			{
-				Debug.LogWarning("[Devin] vswhere found no Visual Studio installations.");
+				Debug.LogWarning($"[Devin] {GeneratorFactoryTypeName} not found in VS assembly.");
 				return null;
 			}
 
-			var vsForWinType = vsAssembly.GetType(VsForWinTypeName);
-			var discoverMethod = vsForWinType?.GetMethod(TryDiscoverInstallationMethod,
-				BindingFlags.Public | BindingFlags.Static);
-			if (discoverMethod == null)
+			// Primary: read the cached legacy instance directly — avoids enum-type matching issues.
+			var legacyField = factoryType.GetField("_legacyStyleProjectGeneration",
+				BindingFlags.NonPublic | BindingFlags.Static);
+			if (legacyField != null)
+			{
+				var generator = legacyField.GetValue(null);
+				if (generator != null)
+				{
+					Debug.Log($"[Devin] Got VS generator via _legacyStyleProjectGeneration: {generator.GetType().Name}");
+					return generator;
+				}
+			}
+
+			// Secondary: call GetInstance(Legacy=2) via reflection.
+			var styleType = vsAssembly.GetType(GeneratorStyleTypeName);
+			if (styleType == null)
+			{
+				Debug.LogWarning($"[Devin] {GeneratorStyleTypeName} not found in VS assembly.");
 				return null;
+			}
 
-			var args = new object[] { devenvPath, null };
-			if (!(bool)discoverMethod.Invoke(null, args) || args[1] == null)
+			var getInstanceMethod = factoryType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+				.FirstOrDefault(m => m.Name == "GetInstance" && m.GetParameters().Length == 1);
+			if (getInstanceMethod == null)
+			{
+				Debug.LogWarning($"[Devin] GeneratorFactory.GetInstance not found.");
 				return null;
+			}
 
-			var generator = ExtractGenerator(args[1]);
-			if (generator != null)
-				Debug.Log("[Devin] VS discovery fallback succeeded via vswhere.");
-
-			return generator;
-		}
-
-		private static object ExtractGenerator(object installation)
-		{
-			if (installation == null)
-				return null;
-
-			return installation.GetType()
-				.GetProperty(ProjectGeneratorPropertyName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-				?.GetValue(installation);
-		}
-
-		private static string RunVsWhere(string vswhereExe)
-		{
 			try
 			{
-				var psi = new System.Diagnostics.ProcessStartInfo
-				{
-					FileName = vswhereExe,
-					Arguments = "-latest -property installationPath",
-					UseShellExecute = false,
-					RedirectStandardOutput = true,
-					CreateNoWindow = true
-				};
-
-				using var proc = System.Diagnostics.Process.Start(psi);
-				var installPath = proc?.StandardOutput.ReadToEnd().Trim();
-				proc?.WaitForExit();
-
-				if (string.IsNullOrEmpty(installPath))
-					return null;
-
-				var devenv = IOPath.Combine(installPath, DevenvRelativePath);
-				return File.Exists(devenv) ? devenv : null;
+				var legacyStyle = Enum.ToObject(styleType, GeneratorStyleLegacy);
+				var generator = getInstanceMethod.Invoke(null, new[] { legacyStyle });
+				Debug.Log($"[Devin] Got VS generator via GeneratorFactory.GetInstance: {generator?.GetType().Name}");
+				return generator;
 			}
 			catch (Exception ex)
 			{
-				Debug.LogWarning($"[Devin] vswhere execution failed: {ex.Message}");
+				var inner = (ex as System.Reflection.TargetInvocationException)?.InnerException ?? ex;
+				Debug.LogWarning($"[Devin] GeneratorFactory.GetInstance threw: {inner.GetType().Name}: {inner.Message}");
 				return null;
 			}
+		}
+
+		// Scans all static fields of IGenerator type across all types in the assembly.
+		// Handles VS Code-family plugins (Cursor, Windsurf) that store a static _generator
+		// field directly on their installation class without a GeneratorFactory.
+		private static object GetGeneratorFromStaticField(Assembly assembly)
+		{
+			Type[] types;
+			try
+			{
+				types = assembly.GetTypes();
+			}
+			catch (ReflectionTypeLoadException ex)
+			{
+				types = ex.Types.Where(t => t != null).ToArray();
+			}
+
+			const string generatorInterface = "IGenerator";
+
+			foreach (var type in types)
+			{
+				if (!type.IsClass)
+					continue;
+
+				foreach (var field in type.GetFields(BindingFlags.NonPublic | BindingFlags.Static))
+				{
+					if (!field.FieldType.GetInterfaces().Any(i => i.Name == generatorInterface)
+						&& field.FieldType.Name != generatorInterface)
+						continue;
+
+					try
+					{
+						var value = field.GetValue(null);
+						if (value == null)
+							continue;
+
+						var syncMethod = value.GetType().GetMethod("Sync",
+							BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+						if (syncMethod == null)
+							continue;
+
+						Debug.Log($"[Devin] Got generator via static field {type.Name}.{field.Name}: {value.GetType().Name}");
+						return value;
+					}
+					catch { }
+				}
+			}
+
+			Debug.LogWarning($"[Devin] No static IGenerator field found in {assembly.GetName().Name}.");
+			return null;
 		}
 
 		public static bool TrySyncIfNeeded(IExternalCodeEditor delegateEditor,
@@ -276,34 +325,30 @@ namespace Unity.Devin.Editor
 				return false;
 
 			bool synced = false;
-			var typeName = delegateEditor.GetType().FullName ?? "";
 
-			// VS Tools' SyncIfNeeded has the same current-editor guard as SyncAll.
+			// VS-family editors (VS Tools, Cursor, etc.) have the same current-editor guard in SyncIfNeeded.
 			// IGenerator.SyncIfNeeded(affectedFiles, reimportedFiles) bypasses it directly.
-			if (typeName.IndexOf(VisualStudio, StringComparison.OrdinalIgnoreCase) >= 0)
+			try
 			{
-				try
+				var generator = GetVSToolsGenerator(delegateEditor);
+				if (generator != null)
 				{
-					var generator = GetVSToolsGenerator(delegateEditor);
-					if (generator != null)
-					{
-						// IGenerator.SyncIfNeeded(IEnumerable<string> affectedFiles, IEnumerable<string> reimportedFiles)
-						var method = generator.GetType().GetMethod(SyncIfNeededMethod,
-							BindingFlags.Public | BindingFlags.Instance, null,
-							new[] { typeof(IEnumerable<string>), typeof(IEnumerable<string>) }, null);
+					// IGenerator.SyncIfNeeded(IEnumerable<string> affectedFiles, IEnumerable<string> reimportedFiles)
+					var method = generator.GetType().GetMethod(SyncIfNeededMethod,
+						BindingFlags.Public | BindingFlags.Instance, null,
+						new[] { typeof(IEnumerable<string>), typeof(IEnumerable<string>) }, null);
 
-						if (method != null)
-						{
-							var affected = ConcatArrays(added, deleted, moved, movedFrom);
-							method.Invoke(generator, new object[] { affected, (IEnumerable<string>)(imported ?? Array.Empty<string>()) });
-							synced = true;
-						}
+					if (method != null)
+					{
+						var affected = ConcatArrays(added, deleted, moved, movedFrom);
+						method.Invoke(generator, new object[] { affected, (IEnumerable<string>)(imported ?? Array.Empty<string>()) });
+						synced = true;
 					}
 				}
-				catch (Exception ex)
-				{
-					Debug.LogWarning($"[Devin] VS Tools internal SyncIfNeeded failed: {ex.Message}. Falling back.");
-				}
+			}
+			catch (Exception ex)
+			{
+				Debug.LogWarning($"[Devin] Internal SyncIfNeeded failed: {ex.Message}. Falling back.");
 			}
 
 			if (!synced)
@@ -356,13 +401,12 @@ namespace Unity.Devin.Editor
 			}
 		}
 
-		private static void WriteOmniSharpSupport()
+		private static void WriteOmniSharpSupport(string solutionPath)
 		{
 			var projectDirectory = IOPath.GetDirectoryName(Application.dataPath);
-			var projectName = IOPath.GetFileName(projectDirectory);
 
 			WriteDirectoryBuildProps(projectDirectory);
-			WriteOmniSharpJson(projectDirectory, projectName);
+			WriteOmniSharpJson(projectDirectory, solutionPath);
 		}
 
 		private static void WriteDirectoryBuildProps(string projectDirectory)
@@ -380,9 +424,9 @@ namespace Unity.Devin.Editor
 			WriteIfChanged(IOPath.Combine(projectDirectory, DirectoryBuildPropsFileName), content);
 		}
 
-		private static void WriteOmniSharpJson(string projectDirectory, string projectName)
+		private static void WriteOmniSharpJson(string projectDirectory, string solutionPath)
 		{
-			var solutionPath = IOPath.Combine(projectDirectory, projectName + SolutionExtension).Replace("\\", "\\\\");
+			solutionPath = solutionPath.Replace("\\", "\\\\");
 			var content =
 				"{\r\n" +
 				"  \"msbuild\": {\r\n" +
@@ -403,14 +447,7 @@ namespace Unity.Devin.Editor
 				"}";
 
 			var filePath = IOPath.Combine(projectDirectory, OmniSharpJsonFileName);
-			if (File.Exists(filePath))
-			{
-				var existing = File.ReadAllText(filePath);
-				if (existing.Contains("\"" + SolutionJsonKey + "\"") && existing.Contains(LoadProjectsOnDemandJsonKey))
-					return;
-			}
-
-			File.WriteAllText(filePath, content, Encoding.UTF8);
+			WriteIfChanged(filePath, content);
 		}
 
 		private static void WriteIfChanged(string filePath, string content)

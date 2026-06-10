@@ -152,19 +152,10 @@ namespace Unity.Devin.Editor
 
 					if (isVsEditor)
 					{
-						var fallback = ReflectedProjectSync.VsFoundViaFallback(selected.GetType().Assembly);
-						if (fallback == true)
-							EditorGUILayout.HelpBox(
-								"Visual Studio was not auto-discovered by the VS plugin, but was found via vswhere fallback.\n" +
-								"Project file generation will work correctly.",
-								MessageType.Info);
-						else
-							EditorGUILayout.HelpBox(
-								"Visual Studio installations were not auto-discovered.\n" +
-								"This is a known VS plugin issue on Unity versions below 6000.5 — " +
-								"the plugin resolves vswhere.exe to a wrong path.\n" +
-								"Click \"Regenerate project files\": the plugin will find VS via a direct vswhere fallback.",
-								MessageType.Info);
+						EditorGUILayout.HelpBox(
+							"Visual Studio installations were not auto-discovered by the VS plugin.\n" +
+							"Project file generation uses GeneratorFactory directly — click \"Regenerate project files\".",
+							MessageType.Info);
 					}
 					else
 						EditorGUILayout.HelpBox(
