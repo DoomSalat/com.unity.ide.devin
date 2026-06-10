@@ -39,6 +39,9 @@ Delegates `.csproj` / `.sln` generation to an already-installed editor plugin �
 - Incremental sync (`SyncIfNeeded`) is handled by the delegate — only changed assemblies are re-evaluated
 - VS Tools' internal `ProjectGenerator.Sync()` is called directly via reflection, bypassing the current-editor guard that would otherwise block it when Devin is selected
 
+**Visual Studio discovery on Unity < 6000.5:**
+`com.unity.ide.visualstudio` 2.0.27 has a bug on Unity versions below 6000.5: it resolves `vswhere.exe` to a wrong CWD-relative path, so VS discovery returns empty. `via-reflection` works around this automatically — when the plugin's own discovery fails, it finds `vswhere.exe` via `PackageInfo.resolvedPath` (always correct regardless of Unity version), runs it directly, and bootstraps the installation. The Preferences panel reflects this: if auto-discovery failed but the fallback succeeded, it shows "found via vswhere fallback" instead of a warning.
+
 **Trade-offs:**
 - Requires `com.unity.ide.rider` or `com.unity.ide.visualstudio` present in `Packages/manifest.json`
 - Generated `.csproj` style depends on the delegate (Rider → SDK-style, VS Tools → Legacy or SDK depending on VS version ≥ 18)
@@ -213,6 +216,26 @@ Relative paths are resolved from the project root (the folder containing `Assets
 "_fingerprint": "..."
 ```
 Remove this field from `package.json` in the local repository. It is only used internally by Unity's git package cache and breaks local package loading.
+
+---
+
+### via-reflection: Visual Studio not found — Preferences shows warning after Regenerate
+
+**Symptom:** After clicking **Regenerate project files**, the Preferences panel still shows "Visual Studio installations were not auto-discovered."
+
+**Cause:** `com.unity.ide.visualstudio` 2.0.27 has a bug on Unity < 6000.5 where `vswhere.exe` is resolved to a nonexistent CWD-relative path (`Packages/com.unity.ide.visualstudio/Editor/VSWhere/vswhere.exe`) instead of the actual package cache path. VS discovery returns an empty dictionary.
+
+The `via-reflection` branch includes an automatic fallback: on the first **Regenerate** click it runs `vswhere.exe` directly (found via `PackageInfo.resolvedPath`) and bootstraps the VS installation. After that the Preferences panel should update to say "found via vswhere fallback".
+
+**If the fallback also fails:**
+- Confirm Visual Studio (Community, Professional, or Enterprise) is installed
+- Run `vswhere.exe -latest -property installationPath` from a terminal — it should output an install path
+- If vswhere returns nothing, VS workload "Desktop development with C++" may be missing; open Visual Studio Installer and add it
+
+As an alternative, downgrade `com.unity.ide.visualstudio` to `2.0.22` in `Packages/manifest.json` — that version does not have the path bug:
+```json
+"com.unity.ide.visualstudio": "2.0.22"
+```
 
 ---
 
